@@ -22,65 +22,88 @@ def save_extent_data(full_disk_filename, yyyymmddhhmn, variable_names, extent, d
             # Convert lat/lon to grid-coordinates
             lly, llx = geo2grid(extent[1], extent[0], full_disk_ds)
             ury, urx = geo2grid(extent[3], extent[2], full_disk_ds)
-            data = full_disk_ds.variables['DQF_Overall'][ury:lly, llx:urx]
+
+            data = full_disk_ds.variables['DQF'][ury:lly, llx:urx]
             dqf_file_name = f'{dest_path}/{yyyymmddhhmn}_DQF.pkl'
-            dqf_file = open(dqf_file_name, 'wb')
-            pickle.dump(data, dqf_file)
+            
+            with open(dqf_file_name, 'wb') as dqf_file:
+                pickle.dump(data, dqf_file)
+
             dqf_saved = True
 
         # Open the file
-        img = gdal.Open(f'NETCDF:{full_disk_filename}:' + var)
+        img = gdal.Open(f'HDF5:{full_disk_filename}://' + var)
+        if img is None:
+            logging.info(f"Não foi possível abrir o arquivo para a variável {var}.")
+            continue
 
         # Read the header metadata
+        # Ler os metadados
         metadata = img.GetMetadata()
-        scale = float(metadata.get(var + '#scale_factor'))
-        offset = float(metadata.get(var + '#add_offset'))
-        undef = float(metadata.get(var + '#_FillValue'))
-        dtime = metadata.get('NC_GLOBAL#time_coverage_start')
+        
+        # Obter os valores de escala e offset dos metadados
+        scale = float(metadata.get('scale_factor', 1.0))
+        offset = float(metadata.get('add_offset', 0.0))
+        undef = int(metadata.get('_FillValue', -1))
 
-        # Load the data
-        ds = img.ReadAsArray(0, 0, img.RasterXSize, img.RasterYSize).astype(float)
+        dtime = metadata.get('time_coverage_start')
 
-        # Apply the scale and offset
+        # Carregar os dados
+        ds = img.ReadAsArray().astype(np.float32)
+
+        # Aplicar a escala e o offset
         ds = (ds * scale + offset)
 
-        # Apply NaN's where the quality flag is greater than 1
-        # ds[ds_dqf > 1] = np.nan
+        # Substituir valores indefinidos por NaN
+        ds[ds == undef] = np.nan
 
-        # Read the original file projection and configure the output projection
+        # Definir a projeção de origem (GOES-R ABI Fixed Grid)
         source_prj = osr.SpatialReference()
-        source_prj.ImportFromProj4(img.GetProjectionRef())
+        source_prj.ImportFromProj4("+proj=geos +h=35786023.0 +a=6378137.0 +b=6356752.31414 +f=0.00335281068119356027 +lat_0=0.0 +lon_0=-75.0 +sweep=x +no_defs")
 
+        # Definir a projeção de destino (WGS84)
         target_prj = osr.SpatialReference()
-        target_prj.ImportFromProj4("+proj=longlat +ellps=WGS84 +datum=WGS84 +no_defs")
+        target_prj.ImportFromEPSG(4326)
 
-        # Reproject the data
-        GeoT = img.GetGeoTransform()
+        # O GeoTransform não está explicitamente fornecido nos metadados,
+        # então vamos calculá-lo com base no tamanho da imagem e na resolução
+        # Assumindo que a resolução é 0.000056 rad, como mencionado nos metadados
+        resolution_rad = 0.000056
+        image_size = 5424
+        geot_x = -resolution_rad * image_size / 2
+        geot_y = resolution_rad * image_size / 2
+        GeoT = (geot_x, resolution_rad, 0, geot_y, 0, -resolution_rad)
+
+        # Criar um raster temporário na memória
         driver = gdal.GetDriverByName('MEM')
-        raw = driver.Create('raw', ds.shape[0], ds.shape[1], 1, gdal.GDT_Float32)
+        raw = driver.Create('', ds.shape[1], ds.shape[0], 1, gdal.GDT_Float32)
         raw.SetGeoTransform(GeoT)
+        raw.SetProjection(source_prj.ExportToWkt())
         raw.GetRasterBand(1).WriteArray(ds)
 
-        # Define the parameters of the output file  
-        options = gdal.WarpOptions(format = 'netCDF', 
-                srcSRS = source_prj, 
-                dstSRS = target_prj,
-                outputBounds = (extent[0], extent[3], extent[2], extent[1]), 
-                outputBoundsSRS = target_prj, 
-                outputType = gdal.GDT_Float32, 
-                srcNodata = undef, 
-                dstNodata = 'nan', 
-                resampleAlg = gdal.GRA_NearestNeighbour)
+        # Definir os parâmetros do arquivo de saída
+        options = gdal.WarpOptions(format='netCDF',
+                                   srcSRS=source_prj,
+                                   dstSRS=target_prj,
+                                   outputBounds=(extent[0], extent[1], extent[2], extent[3]),
+                                   outputBoundsSRS=target_prj,
+                                   outputType=gdal.GDT_Float32,
+                                   srcNodata=undef,
+                                   dstNodata='nan',
+                                   resampleAlg=gdal.GRA_NearestNeighbour)
 
-        # Write the reprojected file on disk
+        # Escrever o arquivo reprojetado no disco
         filename_reprojected = f'{dest_path}/{yyyymmddhhmn}_{var}.nc'
         gdal.Warp(filename_reprojected, raw, options=options)
+
+        print(f"Arquivo salvo: {filename_reprojected}")
 
 #------------------------------------------------------------------------------
 def download_data_for_a_day(extent: List[float], 
                             dest_path: str,
                             yyyymmdd: str, 
-                            product_name: str, 
+                            product_name: str,
+                            band_id: str,
                             variable_names: List[str], 
                             temporal_resolution: int, 
                             remove_full_disk_file: bool = True):
@@ -120,7 +143,7 @@ def download_data_for_a_day(extent: List[float],
         logging.info(f'-Getting data for {yyyymmddhhmn}...')
 
         # Download the full disk file from the Amazon cloud.
-        file_name = download_PROD(yyyymmddhhmn, product_name, TEMP_DIR)
+        file_name = download_PROD(yyyymmddhhmn, product_name, band_id, TEMP_DIR)
 
         if file_name != -1:
             try:
@@ -151,19 +174,22 @@ def main(argv):
     parser.add_argument("--date_ini", type=str, required=True, help="Start date (format: YYYY-MM-DD)")
     parser.add_argument("--date_end", type=str, required=True, help="End date (format: YYYY-MM-DD)")
     parser.add_argument("--prod", type=str, required=True, help="GOES16 product name (e.g., 'ABI-L2-TPWF', 'ABI-L2-DSIF')")
+    parser.add_argument("--band", type=str, default=None, help="Band id (default: None)")
     parser.add_argument("--vars", nargs='+', type=str, required=True, help="At least one variable name (TPW, CAPE, CIN, ...)")
     parser.add_argument("--temporal_resolution", type=int, default=10, help="Temporal resolution of the observations, in minutes (default: 10)")
     
+
     # TODO - check compatibility between the following cmd line args: "prod" and "vars"
 
     # TODO - change to cmd line args
     extent = [-43.890602827150, -23.1339033365138, -43.0483514573222, -22.64972474827293]
-    dest_path = './data/goes16/DSI'
+    dest_path = './data/goes16/CMIP'
 
     args = parser.parse_args()
     start_date = args.date_ini
     end_date = args.date_end
     product_name = args.prod
+    band_id = args.band
     variable_names = args.vars
     temporal_resolution = args.temporal_resolution
 
@@ -179,7 +205,7 @@ def main(argv):
         # Ignore winter months
         if current_datetime.month not in [6, 7, 8]:
             yyyymmdd = current_datetime.strftime('%Y%m%d')
-            df = download_data_for_a_day(extent, dest_path, yyyymmdd, product_name, variable_names, temporal_resolution=temporal_resolution)
+            df = download_data_for_a_day(extent, dest_path, yyyymmdd, product_name, band_id, variable_names, temporal_resolution=temporal_resolution)
         # Increment the current date by one day
         current_datetime += timedelta(days=1)
 

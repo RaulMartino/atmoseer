@@ -135,7 +135,7 @@ def download_CMI(yyyymmddhhmn, band, path_dest):
 s3_client = boto3.client('s3', config=Config(signature_version=UNSIGNED))
 
 #-----------------------------------------------------------------------------------------------------------
-def download_PROD(yyyymmddhhmn, product_name, path_dest):
+def download_PROD(yyyymmddhhmn, product_name, band_id, path_dest):
 
   # os.makedirs(path_dest, exist_ok=True)
 
@@ -153,7 +153,7 @@ def download_PROD(yyyymmddhhmn, product_name, path_dest):
 
   #-----------------------------------------------------------------------------------------------------------
   # File structure
-  prefix = f'{product_name}/{year}/{day_of_year}/{hour}/OR_{product_name}-M6_G16_s{year}{day_of_year}{hour}{min}'
+  prefix = f'{product_name}/{year}/{day_of_year}/{hour}/OR_{product_name}-M6{"C" + band_id if band_id else ''}_G16_s{year}{day_of_year}{hour}{min}'
 
   # Seach for the file on the server
   s3_result = s3_client.list_objects_v2(Bucket=bucket_name, Prefix=prefix, Delimiter = "/")
